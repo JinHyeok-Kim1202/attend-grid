@@ -1,11 +1,12 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import type { CellValueChangedEvent, ColDef, ExcelStyle, GridApi } from "ag-grid-community";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ColDef, ExcelStyle, GridApi, ICellRendererParams } from "ag-grid-community";
 import { AgGridReact } from "ag-grid-react";
-import { Download, Grip, LoaderCircle } from "lucide-react";
+import { Download, LoaderCircle } from "lucide-react";
 
 import {
+  formatAttendanceWorkUnits,
   getCurrentMonthValue,
   getDayField,
   getKoreanMonthLabel,
@@ -15,16 +16,21 @@ import {
 import { agGridModules } from "@/lib/ag-grid";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 
 type AttendanceRow = {
   employeeId: string;
   employeeCode: string;
   name: string;
+  phone: string;
   department: string;
   position: string;
 } & Record<string, string>;
+
+type AttendanceGridRow = AttendanceRow & {
+  rowNumber: string;
+};
 
 type AttendanceResponse = {
   month: string;
@@ -32,12 +38,53 @@ type AttendanceResponse = {
   rows: AttendanceRow[];
 };
 
+type AttendanceSnapshot = Record<string, string>;
+type SavingCellMap = Record<string, true>;
+type InputMode = "input" | "click";
+
+const ALL_DAYS = Array.from({ length: 31 }, (_, index) => index + 1);
+
 const excelStyles: ExcelStyle[] = [
-  { id: "excel-header", font: { bold: true, color: "#233347" }, interior: { color: "#e9f0f8", pattern: "Solid" } },
+  { id: "excel-header", font: { bold: true, color: "#2c2c2a" }, interior: { color: "#f1f5f9", pattern: "Solid" } },
   { id: "work-full-day", interior: { color: "#dcfce7", pattern: "Solid" } },
   { id: "work-partial-day", interior: { color: "#fef3c7", pattern: "Solid" } },
+  { id: "work-overtime-day", interior: { color: "#dbeafe", pattern: "Solid" } },
   { id: "inactive-day", interior: { color: "#f8fafc", pattern: "Solid" }, font: { color: "#94a3b8" } },
 ];
+
+function buildCellKey(employeeId: string, dayField: string) {
+  return `${employeeId}:${dayField}`;
+}
+
+function buildSnapshot(rows: AttendanceRow[]) {
+  return rows.reduce<AttendanceSnapshot>((snapshot, row) => {
+    ALL_DAYS.forEach((day) => {
+      const field = getDayField(day);
+      snapshot[buildCellKey(row.employeeId, field)] = row[field] ?? "";
+    });
+
+    return snapshot;
+  }, {});
+}
+
+function summarizeAttendance(row: AttendanceRow) {
+  let totalWorkUnits = 0;
+  let totalWorkedDays = 0;
+
+  ALL_DAYS.forEach((day) => {
+    const parsed = parseAttendanceWorkUnitsInput(row[getDayField(day)] ?? "");
+
+    if (parsed.isValid && parsed.workUnits != null) {
+      totalWorkUnits += parsed.workUnits;
+      totalWorkedDays += 1;
+    }
+  });
+
+  return {
+    totalWorkUnits: formatAttendanceWorkUnits(totalWorkUnits) || "-",
+    totalWorkedDays: totalWorkedDays > 0 ? String(totalWorkedDays) : "-",
+  };
+}
 
 function getWorkUnitsClass(value: string) {
   const parsed = parseAttendanceWorkUnitsInput(value);
@@ -46,7 +93,118 @@ function getWorkUnitsClass(value: string) {
     return "";
   }
 
-  return parsed.workUnits >= 1 ? "work-full-day" : "work-partial-day";
+  if (parsed.workUnits > 1) {
+    return "work-overtime-day";
+  }
+
+  return parsed.workUnits === 1 ? "work-full-day" : "work-partial-day";
+}
+
+function getNextClickValue(value: string) {
+  const normalized = parseAttendanceWorkUnitsInput(value).normalizedValue;
+
+  if (!normalized) {
+    return "1";
+  }
+
+  if (normalized === "1") {
+    return "0.5";
+  }
+
+  if (normalized === "0.5") {
+    return "1.5";
+  }
+
+  if (normalized === "1.5") {
+    return "";
+  }
+
+  return "";
+}
+
+function TwoLineCell({ top, bottom }: { top: string; bottom: string }) {
+  return (
+    <div className="attendance-two-line-cell">
+      <div>{top}</div>
+      <div>{bottom}</div>
+    </div>
+  );
+}
+
+function EmployeeMetaCell({ top, bottom }: { top: string; bottom: string }) {
+  return (
+    <div className="attendance-meta-cell">
+      <span>{top || "-"}</span>
+      <span>{bottom || "-"}</span>
+    </div>
+  );
+}
+
+function CalendarCell(
+  params: ICellRendererParams<AttendanceGridRow> & {
+    daysInMonth: number;
+    inputMode: InputMode;
+    savingCells: SavingCellMap;
+    onCommit: (employeeId: string, day: number, value: string) => void;
+  }
+) {
+  const row = params.data;
+
+  if (!row) {
+    return null;
+  }
+
+  const renderDay = (day: number | null) => {
+    if (!day || day > params.daysInMonth) {
+      return <div className="attendance-day-cell attendance-day-empty" />;
+    }
+
+    const field = getDayField(day);
+    const value = row[field] ?? "";
+    const statusClass = getWorkUnitsClass(value);
+    const cellKey = buildCellKey(row.employeeId, field);
+    const saving = params.savingCells[cellKey];
+
+    return (
+      <div className={`attendance-day-cell ${statusClass}`} data-day={day}>
+        <span className="attendance-day-number">{day}</span>
+        {params.inputMode === "click" ? (
+          <button
+            className="attendance-day-button"
+            type="button"
+            onClick={() => params.onCommit(row.employeeId, day, getNextClickValue(value))}
+          >
+            {saving ? "..." : value}
+          </button>
+        ) : (
+          <input
+            className="attendance-day-input"
+            defaultValue={value}
+            inputMode="decimal"
+            maxLength={4}
+            onFocus={(event) => event.currentTarget.select()}
+            onBlur={(event) => params.onCommit(row.employeeId, day, event.currentTarget.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.currentTarget.blur();
+              }
+            }}
+          />
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <div className="attendance-calendar-cell">
+      <div className="attendance-calendar-row">
+        {Array.from({ length: 16 }, (_, index) => renderDay(index < 15 ? index + 1 : null))}
+      </div>
+      <div className="attendance-calendar-row">
+        {Array.from({ length: 16 }, (_, index) => renderDay(index + 16))}
+      </div>
+    </div>
+  );
 }
 
 export function AttendanceSheet() {
@@ -54,11 +212,19 @@ export function AttendanceSheet() {
   const [rows, setRows] = useState<AttendanceRow[]>([]);
   const [daysInMonth, setDaysInMonth] = useState(parseMonthValue(month).daysInMonth);
   const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
+  const [savingCells, setSavingCells] = useState<SavingCellMap>({});
   const [error, setError] = useState("");
-  const [gridApi, setGridApi] = useState<GridApi<AttendanceRow> | null>(null);
+  const [gridApi, setGridApi] = useState<GridApi<AttendanceGridRow> | null>(null);
+  const [inputMode, setInputMode] = useState<InputMode>("input");
+  const rowsRef = useRef<AttendanceRow[]>([]);
+  const committedSnapshotRef = useRef<AttendanceSnapshot>({});
 
   const monthInfo = useMemo(() => parseMonthValue(month), [month]);
+  const saving = Object.keys(savingCells).length > 0;
+  const rowData = useMemo<AttendanceGridRow[]>(
+    () => rows.map((row, index) => ({ ...row, rowNumber: String(index + 1) })),
+    [rows]
+  );
 
   useEffect(() => {
     const controller = new AbortController();
@@ -79,7 +245,11 @@ export function AttendanceSheet() {
           throw new Error(data.error || "근태 데이터를 불러오지 못했습니다.");
         }
 
-        setRows(data.rows ?? []);
+        const nextRows = data.rows ?? [];
+
+        rowsRef.current = nextRows;
+        committedSnapshotRef.current = buildSnapshot(nextRows);
+        setRows(nextRows);
         setDaysInMonth(data.daysInMonth ?? monthInfo.daysInMonth);
       } catch (fetchError) {
         if (fetchError instanceof Error && fetchError.name === "AbortError") {
@@ -97,142 +267,178 @@ export function AttendanceSheet() {
     return () => controller.abort();
   }, [month, monthInfo.daysInMonth]);
 
-  const dayColumns = useMemo<ColDef<AttendanceRow>[]>(() => {
-    return Array.from({ length: 31 }, (_, index) => {
-      const day = index + 1;
-      const field = getDayField(day);
-      const inactive = day > daysInMonth;
+  function updateRowValue(employeeId: string, dayField: string, value: string) {
+    setRows((currentRows) => {
+      const nextRows = currentRows.map((row) => (row.employeeId === employeeId ? { ...row, [dayField]: value } : row));
 
-      return {
-        field,
-        headerName: `${day}일`,
-        minWidth: 92,
-        maxWidth: 102,
-        editable: !inactive,
-        singleClickEdit: true,
-        valueSetter: (params) => {
-          const parsed = parseAttendanceWorkUnitsInput(params.newValue);
-
-          if (!parsed.isValid || !params.data) {
-            if (!parsed.isValid) {
-              setError(parsed.error ?? "근무량 형식이 올바르지 않습니다.");
-            }
-
-            return false;
-          }
-
-          const nextValue = parsed.normalizedValue;
-
-          if (params.data[field] === nextValue) {
-            return false;
-          }
-
-          params.data[field] = nextValue;
-          setError("");
-
-          return true;
-        },
-        cellClass: ({ value }) => {
-          const classes = ["attendance-cell"];
-
-          if (inactive) {
-            classes.push("attendance-cell-inactive", "inactive-day");
-          }
-
-          const statusClass = typeof value === "string" ? getWorkUnitsClass(value) : "";
-
-          if (statusClass) {
-            classes.push(statusClass);
-          }
-
-          return classes;
-        },
-        headerClass: inactive ? "attendance-header-inactive" : "attendance-header-day",
-      } satisfies ColDef<AttendanceRow>;
+      rowsRef.current = nextRows;
+      return nextRows;
     });
-  }, [daysInMonth]);
+  }
 
-  const columnDefs = useMemo<ColDef<AttendanceRow>[]>(
-    () => [
-      { field: "name", headerName: "이름", pinned: "left", minWidth: 150, maxWidth: 180 },
-      { field: "department", headerName: "부서", pinned: "left", minWidth: 120, maxWidth: 140 },
-      { field: "position", headerName: "직책", pinned: "left", minWidth: 120, maxWidth: 140 },
-      ...dayColumns,
-    ],
-    [dayColumns]
+  function setCellSaving(cellKey: string, active: boolean) {
+    setSavingCells((current) => {
+      if (active) {
+        return { ...current, [cellKey]: true };
+      }
+
+      const next = { ...current };
+      delete next[cellKey];
+      return next;
+    });
+  }
+
+  const commitAttendanceValue = useCallback(
+    async (employeeId: string, day: number, rawValue: string) => {
+      if (day < 1 || day > daysInMonth) {
+        return;
+      }
+
+      const dayField = getDayField(day);
+      const parsed = parseAttendanceWorkUnitsInput(rawValue);
+
+      if (!parsed.isValid) {
+        setError(parsed.error ?? "근무량 형식이 올바르지 않습니다.");
+        gridApi?.refreshCells({ force: true });
+        return;
+      }
+
+      const nextValue = parsed.normalizedValue;
+      const cellKey = buildCellKey(employeeId, dayField);
+      const previousValue = committedSnapshotRef.current[cellKey] ?? "";
+
+      if (nextValue === previousValue) {
+        updateRowValue(employeeId, dayField, nextValue);
+        setError("");
+        return;
+      }
+
+      updateRowValue(employeeId, dayField, nextValue);
+      setCellSaving(cellKey, true);
+      setError("");
+
+      try {
+        const response = await fetch("/api/attendance", {
+          method: "PATCH",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            employeeId,
+            month,
+            day,
+            value: nextValue,
+          }),
+        });
+
+        const data = (await response.json()) as { error?: string; value?: string };
+
+        if (!response.ok) {
+          throw new Error(data.error || "근태 저장에 실패했습니다.");
+        }
+
+        const savedValue = typeof data.value === "string" ? data.value : nextValue;
+
+        committedSnapshotRef.current[cellKey] = savedValue;
+
+        if (savedValue !== nextValue) {
+          updateRowValue(employeeId, dayField, savedValue);
+        }
+      } catch (saveError) {
+        updateRowValue(employeeId, dayField, previousValue);
+        setError(saveError instanceof Error ? saveError.message : "근태 저장에 실패했습니다.");
+      } finally {
+        setCellSaving(cellKey, false);
+      }
+    },
+    [daysInMonth, gridApi, month]
   );
 
-  const defaultColDef = useMemo<ColDef<AttendanceRow>>(
+  const columnDefs = useMemo<ColDef<AttendanceGridRow>[]>(
+    () => [
+      {
+        pinned: "left",
+        field: "rowNumber",
+        headerName: "No",
+        width: 58,
+        cellClass: "attendance-cell attendance-cell-center attendance-cell-muted",
+      },
+      {
+        pinned: "left",
+        field: "name",
+        headerName: "성명",
+        width: 122,
+        cellClass: "attendance-cell attendance-cell-strong",
+      },
+      {
+        pinned: "left",
+        headerName: "사번 / 부서",
+        width: 156,
+        cellRenderer: ({ data }: ICellRendererParams<AttendanceGridRow>) =>
+          data ? <EmployeeMetaCell top={data.employeeCode} bottom={data.department} /> : null,
+        cellClass: "attendance-cell",
+      },
+      {
+        pinned: "left",
+        headerName: "연락처 / 직책",
+        width: 168,
+        cellRenderer: ({ data }: ICellRendererParams<AttendanceGridRow>) =>
+          data ? <EmployeeMetaCell top={data.phone} bottom={data.position} /> : null,
+        cellClass: "attendance-cell",
+      },
+      {
+        headerName: `${getKoreanMonthLabel(month)} 출근현황`,
+        width: 532,
+        minWidth: 532,
+        sortable: false,
+        suppressSizeToFit: true,
+        cellRenderer: (params: ICellRendererParams<AttendanceGridRow>) => (
+          <CalendarCell
+            {...params}
+            daysInMonth={daysInMonth}
+            inputMode={inputMode}
+            savingCells={savingCells}
+            onCommit={commitAttendanceValue}
+          />
+        ),
+        cellClass: "attendance-cell attendance-cell-calendar",
+      },
+      {
+        headerName: "총공수 / 총일수",
+        width: 104,
+        cellRenderer: ({ data }: ICellRendererParams<AttendanceGridRow>) => {
+          if (!data) {
+            return null;
+          }
+
+          const summary = summarizeAttendance(data);
+
+          return <TwoLineCell top={summary.totalWorkUnits} bottom={summary.totalWorkedDays} />;
+        },
+        cellClass: "attendance-cell attendance-cell-numeric",
+      },
+    ],
+    [commitAttendanceValue, daysInMonth, inputMode, month, savingCells]
+  );
+
+  const defaultColDef = useMemo<ColDef<AttendanceGridRow>>(
     () => ({
       sortable: false,
       filter: false,
       resizable: true,
       suppressMovable: true,
+      headerClass: "attendance-header",
+      cellClass: "attendance-cell",
     }),
     []
   );
-
-  async function persistCellChange(event: CellValueChangedEvent<AttendanceRow>) {
-    const field = event.colDef.field;
-
-    if (!field || !field.startsWith("day") || !event.data) {
-      return;
-    }
-
-    const newValue = event.newValue;
-    const oldValue = event.oldValue;
-
-    const parsed = parseAttendanceWorkUnitsInput(newValue);
-
-    if (!parsed.isValid || parsed.normalizedValue === oldValue) {
-      return;
-    }
-
-    const day = Number(field.replace("day", ""));
-
-    setSaving(true);
-    setError("");
-
-    try {
-      const response = await fetch("/api/attendance", {
-        method: "PATCH",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          employeeId: event.data.employeeId,
-          month,
-          day,
-          value: parsed.normalizedValue,
-        }),
-      });
-
-      const data = (await response.json()) as { error?: string; value?: string };
-
-      if (!response.ok) {
-        throw new Error(data.error || "근태 저장에 실패했습니다.");
-      }
-
-      if (typeof data.value === "string" && data.value !== parsed.normalizedValue) {
-        event.node.setDataValue(field, data.value);
-      }
-    } catch (saveError) {
-      event.node.setDataValue(field, oldValue ?? "");
-      setError(saveError instanceof Error ? saveError.message : "근태 저장에 실패했습니다.");
-    } finally {
-      setSaving(false);
-    }
-  }
 
   return (
     <div className="space-y-6">
       <Card className="border border-border/70 bg-white/92 shadow-sm">
         <CardHeader className="gap-4 md:flex md:flex-row md:items-end md:justify-between">
           <div>
-            <CardTitle>작업 공수 시트</CardTitle>
-            <CardDescription>
-              셀에 `1`, `0.5`처럼 숫자를 직접 입력해 월별 작업량을 관리합니다. 비워 두면 해당 날짜는 미작업으로 처리됩니다.
-            </CardDescription>
+            <CardTitle>직원 근태 관리</CardTitle>
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <Badge variant="outline" className="border-sky-200 bg-sky-50 text-sky-700">
@@ -257,7 +463,7 @@ export function AttendanceSheet() {
               <Input
                 id="attendance-month"
                 type="month"
-                className="h-10 w-[180px] rounded-xl border-border/80 bg-white shadow-sm"
+                className="h-10 w-[180px] rounded-md border-border/80 bg-white shadow-sm"
                 value={month}
                 onChange={(event) => setMonth(event.target.value || getCurrentMonthValue())}
               />
@@ -269,59 +475,58 @@ export function AttendanceSheet() {
               ) : null}
             </div>
 
-            <div className="flex flex-wrap gap-2 text-xs">
-              {[
-                { label: "비움", description: "미작업" },
-                { label: "1", description: "하루 작업" },
-                { label: "0.5", description: "반일 작업" },
-              ].map((item) => (
-                <Badge key={item.label} variant="outline" className="border-border/70 bg-background text-foreground">
-                  {item.label} = {item.description}
-                </Badge>
-              ))}
-            </div>
-          </div>
-
-          <div className="rounded-2xl border border-border/70 bg-slate-50/70 px-4 py-3 text-sm text-slate-600">
-            <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
-              <span className="inline-flex items-center gap-2">
-                <Grip className="size-4" />
-                드래그 채우기 지원
-              </span>
-              <span>`Ctrl/Cmd + C`, `Ctrl/Cmd + V` 복사/붙여넣기</span>
-              <span>마우스 드래그로 다중 셀 선택</span>
-              <span>입력값은 0보다 크고 1 이하여야 합니다</span>
+            <div className="flex flex-wrap items-center gap-3">
+              <div className="attendance-mode-switch" aria-label="근태 입력 방식">
+                <button
+                  className={inputMode === "input" ? "active" : ""}
+                  type="button"
+                  onClick={() => setInputMode("input")}
+                >
+                  직접입력
+                </button>
+                <button
+                  className={inputMode === "click" ? "active" : ""}
+                  type="button"
+                  onClick={() => setInputMode("click")}
+                >
+                  클릭
+                </button>
+              </div>
+              <div className="attendance-legend">
+                <span>
+                  <i className="legend-full" />1일
+                </span>
+                <span>
+                  <i className="legend-partial" />0.5일
+                </span>
+                <span>
+                  <i className="legend-overtime" />1.5일
+                </span>
+              </div>
             </div>
           </div>
 
           {error ? (
-            <div className="rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+            <div className="rounded-md border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
               {error}
             </div>
           ) : null}
 
           <div className="attendance-sheet-grid ag-theme-quartz h-[720px] w-full">
-            <AgGridReact<AttendanceRow>
+            <AgGridReact<AttendanceGridRow>
               modules={agGridModules}
-              rowData={rows}
+              rowData={rowData}
               columnDefs={columnDefs}
               defaultColDef={defaultColDef}
+              getRowId={({ data }) => data.employeeId}
               animateRows
               loading={loading}
-              cellSelection={{
-                suppressMultiRanges: false,
-                enableHeaderHighlight: true,
-                handle: {
-                  mode: "fill",
-                  direction: "xy",
-                },
-              }}
-              undoRedoCellEditing
-              undoRedoCellEditingLimit={200}
+              rowHeight={68}
+              headerHeight={46}
+              suppressRowTransform
               stopEditingWhenCellsLoseFocus
               excelStyles={excelStyles}
               onGridReady={({ api }) => setGridApi(api)}
-              onCellValueChanged={(event) => void persistCellChange(event)}
               overlayNoRowsTemplate={
                 '<div style="padding:24px;text-align:center;color:#64748b;">등록된 직원이 없습니다. 먼저 직원 정보를 추가해 주세요.</div>'
               }

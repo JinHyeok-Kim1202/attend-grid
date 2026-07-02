@@ -11,7 +11,7 @@ export type AttendanceStatusValue = (typeof ATTENDANCE_STATUS_OPTIONS)[number];
 
 export const ATTENDANCE_FULL_DAY_UNITS = 1;
 export const ATTENDANCE_HALF_DAY_UNITS = 0.5;
-export const ATTENDANCE_MAX_WORK_UNITS = 1;
+export const ATTENDANCE_MAX_WORK_UNITS = 1.5;
 
 export function isAttendanceStatusValue(value: string): value is AttendanceStatusValue {
   return ATTENDANCE_STATUS_OPTIONS.includes(value as AttendanceStatusValue);

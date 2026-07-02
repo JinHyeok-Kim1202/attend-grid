@@ -16,6 +16,7 @@ type AttendanceRow = {
   employeeId: string;
   employeeCode: string;
   name: string;
+  phone: string;
   department: string;
   position: string;
 } & Record<string, string>;
@@ -31,6 +32,7 @@ type EmployeeRecord = {
   id: string;
   employeeCode: string;
   fullName: string;
+  phone: string;
   department: string;
   position: string;
 };
@@ -59,6 +61,7 @@ export async function GET(request: Request) {
         id: true,
         employeeCode: true,
         fullName: true,
+        phone: true,
         department: true,
         position: true,
       },
@@ -100,6 +103,7 @@ export async function GET(request: Request) {
         employeeId: employee.id,
         employeeCode: employee.employeeCode,
         name: employee.fullName,
+        phone: employee.phone,
         department: employee.department,
         position: employee.position,
       };
